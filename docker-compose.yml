@@ -1,0 +1,61 @@
+services:
+  core:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.core
+    environment:
+      ENVIRONMENT: development
+      ALLOW_INSECURE_MCP_URLS: "true"
+      INTERNAL_SERVICE_TOKEN: "${INTERNAL_SERVICE_TOKEN:-local-dev-service-token-change-me}"
+      GATEWAY_URL: "http://gateway:8080"
+      PORT: "8000"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gateway
+    environment:
+      AGENTWALL_ENVIRONMENT: development
+      AGENTWALL_CORE_URL: "http://core:8000"
+      AGENTWALL_CORE_SERVICE_TOKEN: "${INTERNAL_SERVICE_TOKEN:-local-dev-service-token-change-me}"
+      AGENTWALL_ALLOW_INSECURE_UPSTREAMS: "true"
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  demo-mcp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.demo-mcp
+    ports:
+      - "9100:9100"
+
+  ui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ui
+      args:
+        NEXT_PUBLIC_REDHAND_CORE_URL: "${NEXT_PUBLIC_REDHAND_CORE_URL:-http://localhost:8000}"
+        NEXT_PUBLIC_REDHAND_GATEWAY_URL: "${NEXT_PUBLIC_REDHAND_GATEWAY_URL:-http://localhost:8080}"
+    ports:
+      - "3000:3000"
+    depends_on:
+      core:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy

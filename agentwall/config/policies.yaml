@@ -1,0 +1,202 @@
+version: "1.0"
+settings:
+  fail_mode: "fail_closed"
+  default_token_ttl_seconds: 30
+  max_token_ttl_seconds: 60
+  egress_dlp_enabled: true
+  enable_hash_chaining: true
+
+tools:
+  execute_sql:
+    type: "sql"
+    description: "Executes read-only analytical SQL queries against the enterprise warehouse."
+    upstream_url: "http://localhost:9001/api/sql"
+    iam_provider: "local_sts"
+    target_audience: "https://warehouse.data.internal"
+    required_user_roles:
+      - "finance_viewer"
+      - "data_analyst"
+      - "admin"
+    allowed_statements:
+      - "SELECT"
+    forbidden_clauses:
+      - "INTO OUTFILE"
+      - "DUMPFILE"
+      - "LOAD_FILE"
+      - "EXEC"
+      - "EXECUTE"
+    forbidden_columns:
+      - "password_hash"
+      - "secret_key"
+      - "ssn"
+      - "api_key"
+      - "auth_token"
+    max_rows_limit: 50
+    schema:
+      type: "object"
+      required:
+        - "query"
+      properties:
+        query:
+          type: "string"
+          minLength: 1
+          maxLength: 8192
+        max_rows:
+          type: "integer"
+          minimum: 1
+          maximum: 1000
+      additionalProperties: false
+
+  run_shell_cmd:
+    type: "shell"
+    description: "Executes vetted administrative and diagnostic shell commands in containment."
+    upstream_url: "http://localhost:9002/api/shell"
+    iam_provider: "vault"
+    target_audience: "https://node-diagnostics.internal"
+    required_user_roles:
+      - "sre"
+      - "admin"
+    allowed_binaries:
+      - "ls"
+      - "grep"
+      - "cat"
+      - "tail"
+      - "head"
+      - "echo"
+      - "pwd"
+      - "wc"
+      - "stat"
+      - "uptime"
+      - "date"
+    block_chaining: true
+    block_subshells: true
+    block_dangerous_primitives: true
+    schema:
+      type: "object"
+      required:
+        - "command"
+      properties:
+        command:
+          type: "string"
+          minLength: 1
+          maxLength: 1024
+        timeout_seconds:
+          type: "integer"
+          minimum: 1
+          maximum: 30
+      additionalProperties: false
+
+  run_terminal_command:
+    type: "shell"
+    description: "Executes terminal commands with POSIX lexical security and pipe restrictions."
+    upstream_url: "http://localhost:9002/api/terminal"
+    iam_provider: "local_sts"
+    target_audience: "https://node-diagnostics.internal"
+    allowed_binaries:
+      - "ls"
+      - "grep"
+      - "cat"
+      - "tail"
+      - "head"
+      - "echo"
+      - "pwd"
+      - "wc"
+    block_chaining: true
+    block_subshells: true
+    block_dangerous_primitives: true
+    schema:
+      type: "object"
+      required:
+        - "command"
+      properties:
+        command:
+          type: "string"
+          minLength: 1
+          maxLength: 1024
+      additionalProperties: false
+
+  fetch_customer_data:
+    type: "rest"
+    description: "Retrieves customer CRM record by customer ID with strict regex validation."
+    upstream_url: "http://localhost:9003/api/customers"
+    iam_provider: "gcp_sts"
+    target_audience: "//crm.googleapis.com/projects/prod/customers"
+    egress_dlp: true
+    schema:
+      type: "object"
+      required:
+        - "customer_id"
+      properties:
+        customer_id:
+          type: "string"
+          pattern: "^CUST-[0-9]{4,8}$"
+        fields:
+          type: "array"
+          items:
+            type: "string"
+          maxItems: 10
+      additionalProperties: false
+
+  fetch_customer_record:
+    type: "rest"
+    description: "Retrieves customer CRM record by customer ID with strict regex validation."
+    upstream_url: "http://localhost:9003/api/customers"
+    iam_provider: "gcp_sts"
+    target_audience: "//crm.googleapis.com/projects/prod/customers"
+    egress_dlp: true
+    schema:
+      type: "object"
+      required:
+        - "customer_id"
+      properties:
+        customer_id:
+          type: "string"
+          pattern: "^CUST-[0-9]{4,8}$"
+        fields:
+          type: "array"
+          items:
+            type: "string"
+          maxItems: 10
+      additionalProperties: false
+
+  azure_blob_inspect:
+    type: "rest"
+    description: "Inspects Azure Blob storage container metadata with delegated identity."
+    upstream_url: "http://localhost:9004/api/azure/blob"
+    iam_provider: "azure_sts"
+    target_audience: "https://management.azure.com"
+    required_user_roles:
+      - "cloud_operator"
+      - "admin"
+    schema:
+      type: "object"
+      required:
+        - "container_name"
+      properties:
+        container_name:
+          type: "string"
+          pattern: "^[a-z0-9-]{3,63}$"
+      additionalProperties: false
+
+  github_read_issue:
+    type: "rest"
+    description: "Retrieves issue metadata from GitHub repository via scoped SaaS token."
+    upstream_url: "http://localhost:9005/api/github/issues"
+    iam_provider: "saas"
+    target_audience: "https://api.github.com"
+    required_user_roles:
+      - "developer"
+      - "admin"
+    schema:
+      type: "object"
+      required:
+        - "repo"
+        - "issue_number"
+      properties:
+        repo:
+          type: "string"
+          pattern: "^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$"
+        issue_number:
+          type: "integer"
+          minimum: 1
+      additionalProperties: false

@@ -1,0 +1,22 @@
+# Keeps the image build context small and free of local state/secrets.
+.git
+.github
+.env
+.env.*
+!.env.example
+!apps/redhand-ui/.env.example
+*.pem
+*.key
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+node_modules
+**/node_modules
+**/.next
+docs
+supabase
+tests
+**/tests

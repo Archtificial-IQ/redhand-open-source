@@ -1,0 +1,692 @@
+"""
+Agent authentication.
+
+- POST /v1/agent-auth/token: an agent exchanges its agent key for a short-lived access
+  token. Refused unless the passport is currently active (not frozen, revoked or expired).
+- GET  /v1/agent-auth/jwks: public verification key for the gateway (public data).
+- GET  /internal/v1/gateway-context: the gateway's per-call authorization lookup,
+  authenticated with the internal service token.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import date, datetime, timedelta
+import hashlib
+import hmac
+import logging
+import re
+import time
+from typing import Annotated, Any, Literal
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from pydantic import BaseModel
+
+from redhand_core.destinations.hosts import normalize_host
+from redhand_core.fintech.models import ARG_PATH_PATTERN, CURRENCY_PATTERN, TOOL_NAME_PATTERN
+from redhand_core.auth import bearer_token
+from redhand_core.config import Settings, get_settings
+from redhand_core.net.source import client_source
+from redhand_core.services.rate_limit import SlidingWindowLimiter
+from redhand_core.passports import budget as budget_rules
+from redhand_core.passports.credentials import AgentTokenSigner, hash_agent_key, looks_like_agent_key
+from redhand_core.passports.models import (
+    SERVER_SLUG_PATTERN,
+    PassportStatus,
+    Scope,
+    effective_status,
+    parse_scopes,
+    parse_timestamp,
+    utcnow,
+)
+from redhand_core.routers.telemetry import get_supabase_service_client
+from redhand_core.spend import service as spend_service
+from redhand_core.spend.models import GatewayModelSpend
+from redhand_core.spend.service import MODEL_SERVER_NAME
+
+logger = logging.getLogger("redhand.core.agent_auth")
+
+router = APIRouter(tags=["Agent Authentication"])
+SupabaseDep = Annotated[Any, Depends(get_supabase_service_client)]
+
+# -----------------------------------------------------------------------------
+# Signer
+# -----------------------------------------------------------------------------
+
+_signers: dict[str, AgentTokenSigner] = {}
+_DEV_SIGNER_KEY = "__development__"
+
+
+def get_agent_token_signer(settings: Annotated[Settings, Depends(get_settings)]) -> AgentTokenSigner:
+    configured = settings.AGENT_TOKEN_SIGNING_KEY
+    if configured is not None:
+        pem = configured.get_secret_value()
+        cache_key = hashlib.sha256(pem.encode("utf-8")).hexdigest()
+        if cache_key not in _signers:
+            _signers[cache_key] = AgentTokenSigner.from_pem(pem)
+        return _signers[cache_key]
+    if settings.ENVIRONMENT in ("development", "test"):
+        if _DEV_SIGNER_KEY not in _signers:
+            logger.warning("AGENT_TOKEN_SIGNING_KEY not set; using a random per-process dev key")
+            _signers[_DEV_SIGNER_KEY] = AgentTokenSigner.generate()
+        return _signers[_DEV_SIGNER_KEY]
+    logger.error("AGENT_TOKEN_SIGNING_KEY is not configured; agent token issuance is disabled")
+    raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Agent authentication is not configured.")
+
+
+SignerDep = Annotated[AgentTokenSigner, Depends(get_agent_token_signer)]
+
+# -----------------------------------------------------------------------------
+# Rate limiting (per agent key). In-process; adequate for a single core instance.
+# -----------------------------------------------------------------------------
+
+
+_exchange_limiter = SlidingWindowLimiter()  # per agent key
+_source_limiter = SlidingWindowLimiter()  # per source address, across every key it tries
+
+# -----------------------------------------------------------------------------
+# Token exchange
+# -----------------------------------------------------------------------------
+
+
+class AgentTokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    expires_at: datetime
+    agent_id: UUID
+    organization_id: UUID
+    passport_version: int
+
+
+def _invalid_key() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid agent key.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+@router.post("/v1/agent-auth/token", response_model=AgentTokenResponse)
+async def exchange_agent_key(
+    request: Request,
+    supabase: SupabaseDep,
+    settings: Annotated[Settings, Depends(get_settings)],
+    signer: SignerDep,
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+) -> AgentTokenResponse:
+    # Per source first, before any hashing or database read: a caller trying one new key after another is limited as a caller, not per guess.
+    source = client_source(request.scope, settings.TRUSTED_PROXY_HOPS)
+    if not _source_limiter.allow(source, settings.AGENT_TOKEN_EXCHANGES_PER_MINUTE_PER_SOURCE, time.monotonic()):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many token requests from this address.",
+            headers={"Retry-After": "60"},
+        )
+
+    presented = bearer_token(authorization) or ""
+    if not looks_like_agent_key(presented):
+        raise _invalid_key()
+    key_hash = hash_agent_key(presented)
+
+    if not _exchange_limiter.allow(key_hash, settings.AGENT_TOKEN_EXCHANGES_PER_MINUTE, time.monotonic()):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many token requests for this agent key.",
+            headers={"Retry-After": "60"},
+        )
+
+    key_res = await (
+        supabase.table("agent_keys")
+        .select("id, agent_id, organization_id, is_active")
+        .eq("key_hash", key_hash)
+        .eq("is_active", True)
+        .maybe_single()
+        .execute()
+    )
+    key_row = key_res.data if key_res else None
+    if not key_row:
+        raise _invalid_key()
+
+    agent_res = await (
+        supabase.table("agents")
+        .select("*")
+        .eq("id", str(key_row["agent_id"]))
+        .eq("organization_id", str(key_row["organization_id"]))
+        .maybe_single()
+        .execute()
+    )
+    agent = agent_res.data if agent_res else None
+    if not agent:
+        raise _invalid_key()
+
+    now = utcnow()
+    current = effective_status(str(agent.get("status")), agent.get("expires_at"), now)
+    if current != "active":
+        logger.info("Token exchange refused: agent=%s status=%s", agent["id"], current)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Agent passport is {current}.",
+        )
+    if agent.get("reported_only") is True:
+        # Created by an SDK key's telemetry, not by a person (C1b): no gateway access until an admin promotes it.
+        logger.info("Token exchange refused: agent=%s is reported only", agent["id"])
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Agent passport is reported only: an admin must promote it on the Passports page before it can use the gateway.",
+        )
+
+    ttl = timedelta(seconds=settings.AGENT_TOKEN_TTL_SECONDS)
+    token, jti, expires_at = signer.issue(
+        agent_id=UUID(str(agent["id"])),
+        organization_id=UUID(str(agent["organization_id"])),
+        passport_version=int(agent.get("version") or 1),
+        now=now,
+        ttl=ttl,
+    )
+    await (
+        supabase.table("agent_keys")
+        .update({"last_used_at": now.isoformat()})
+        .eq("id", str(key_row["id"]))
+        .execute()
+    )
+    logger.info("Issued agent access token: agent=%s jti=%s", agent["id"], jti)
+    return AgentTokenResponse(
+        access_token=token,
+        expires_in=int(ttl.total_seconds()),
+        expires_at=expires_at,
+        agent_id=UUID(str(agent["id"])),
+        organization_id=UUID(str(agent["organization_id"])),
+        passport_version=int(agent.get("version") or 1),
+    )
+
+
+@router.get("/v1/agent-auth/jwks")
+async def agent_token_jwks(signer: SignerDep) -> dict[str, list[dict[str, str]]]:
+    return {"keys": [signer.public_jwk()]}
+
+
+# -----------------------------------------------------------------------------
+# Internal: gateway authorization context
+# -----------------------------------------------------------------------------
+
+
+def require_internal_service(
+    settings: Annotated[Settings, Depends(get_settings)],
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+) -> None:
+    expected = settings.INTERNAL_SERVICE_TOKEN
+    if expected is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Internal API is not configured.")
+    presented = bearer_token(authorization)
+    if not presented or not hmac.compare_digest(presented, expected.get_secret_value()):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid service credentials.")
+
+
+class GatewayHoneytoken(BaseModel):
+    """What the gateway needs to spot a honeytoken: its id and SHA-256 digest. Never the value."""
+
+    id: UUID
+    digest: str
+
+
+class GatewayHoneyTool(BaseModel):
+    """A decoy tool to add to this agent's tools/list on this server."""
+
+    id: UUID
+    name: str
+    description: str
+
+
+class GatewayAgentContext(BaseModel):
+    id: UUID
+    organization_id: UUID
+    status: PassportStatus
+    version: int
+    scopes: list[Scope]
+    expires_at: datetime
+    safe_mode: bool
+    # Whether the gateway should build Black Box payload excerpts. Anything but an explicit true is false.
+    payload_capture: bool
+    budget: GatewayBudgetContext
+    # The organization's active honeytoken digests and this agent's decoy tools on the requested server. The
+    # gateway requires both fields and denies if they are missing (an older core), like safe_mode and budget.
+    honeytokens: list[GatewayHoneytoken]
+    honey_tools: list[GatewayHoneyTool]
+    # Prompt Injection Radar and output checks (Phase 4 M4.3). Only "off" or "observe" exist (block is not built). The gateway
+    # requires both fields and denies if they are missing (an older core), like the fields above. Deploy core before the gateway.
+    radar_mode: Literal["off", "observe"]
+    output_check_mode: Literal["off", "observe"]
+    # Loop detection (Phase 4 M6). The gateway requires all four, like the fields above (an older core makes the lookup fail and the
+    # call is denied): deploy core before the gateway. `loop_exempt` is true while a suppression of RAD-LOOP-001 is live for this agent.
+    loop_mode: Literal["off", "observe", "throttle"]
+    loop_limit: int
+    loop_window_seconds: int
+    loop_exempt: bool
+    # Destination allowlist (Phase 4 M7). Required by the gateway, like the fields above: an older core makes the lookup fail and the call is
+    # denied. Deploy core before the gateway. The list is sent only while the mode is not "off".
+    destination_mode: Literal["off", "observe", "enforce"]
+    allowed_destinations: list[str]
+    blocked_destinations: list[str] = []
+    # B5c. Required by the gateway, though null when there is nothing to check (an older core omits the key, so the lookup fails and the call is denied): deploy core before the gateway.
+    model_spend: GatewayModelSpend | None
+
+
+class GatewayBudgetContext(BaseModel):
+    """Budget Guard state for the gateway. Usage by the CALLER's own instance is not included: the
+    gateway adds its own exact local count, so own calls are never double-counted or delayed."""
+
+    daily_call_limit: int | None
+    used_by_other_instances: int
+    day_key: date
+    resets_at: datetime
+    action: Literal["deny", "freeze"]
+
+
+class GatewayApprovedTool(BaseModel):
+    tool: str
+    digest: str
+
+
+class GatewayServerContext(BaseModel):
+    slug: str
+    url: str
+    # Tool pinning (Phase 4 M3). The gateway requires both fields: an older core that sends neither makes the lookup fail
+    # and the call is denied, rather than running with no pin checks. `approved_tools` is only filled in enforce mode
+    # (alert mode needs no list), which keeps the context small.
+    pin_mode: Literal["off", "alert", "enforce"]
+    approved_tools: list[GatewayApprovedTool]
+
+
+class GatewayFintechBinding(BaseModel):
+    """Where one bound payment tool keeps its amount, currency and payee. Paths only, never values."""
+
+    tool: str
+    amount_path: str
+    currency_path: str | None
+    fixed_currency: str | None
+    beneficiary_path: str | None
+
+
+class GatewayFintechContext(BaseModel):
+    """Fintech Shield settings for this call (Phase 6, ADR 0033). Sent only while the organization's mode is not "off" and the server is known.
+    The gateway reads it from S2 on; an older gateway ignores the field. `bindings` holds this server's bound payment tools only."""
+
+    mode: Literal["observe", "enforce"]
+    holidays: list[date]
+    utc_offset_minutes: int
+    bindings: list[GatewayFintechBinding]
+
+
+class GatewayContextResponse(BaseModel):
+    agent: GatewayAgentContext
+    server: GatewayServerContext | None
+    fintech: GatewayFintechContext | None = None
+
+
+LAST_SEEN_WRITE_INTERVAL_SECONDS = 60
+MAX_FINTECH_BINDINGS_PER_SERVER = 50
+_FINTECH_PATH = re.compile(ARG_PATH_PATTERN)
+_FINTECH_TOOL = re.compile(TOOL_NAME_PATTERN)
+_FINTECH_CURRENCY = re.compile(CURRENCY_PATTERN)
+
+
+def _checked_fintech_binding(row: Any) -> dict[str, Any]:
+    """A stored binding exactly as the table's checks allow it, or ValueError (the caller decides what a malformed row means)."""
+    if not isinstance(row, dict):
+        raise ValueError("binding row is not an object")
+
+    def path(value: Any, required: bool) -> str | None:
+        if value is None and not required:
+            return None
+        if not isinstance(value, str) or len(value) > 256 or not _FINTECH_PATH.fullmatch(value):
+            raise ValueError("malformed binding path")
+        return value
+
+    tool, fixed = row.get("tool"), row.get("fixed_currency")
+    if not isinstance(tool, str) or not _FINTECH_TOOL.fullmatch(tool):
+        raise ValueError("malformed tool name")
+    if fixed is not None and (not isinstance(fixed, str) or not _FINTECH_CURRENCY.fullmatch(fixed)):
+        raise ValueError("malformed fixed currency")
+    checked = {
+        "tool": tool, "amount_path": path(row.get("amount_path"), True), "currency_path": path(row.get("currency_path"), False),
+        "fixed_currency": fixed, "beneficiary_path": path(row.get("beneficiary_path"), False),
+    }
+    if (checked["currency_path"] is None) == (fixed is None):
+        raise ValueError("a binding needs exactly one currency source")
+    return checked
+
+
+def _fintech_holidays(org_row: Any) -> list[date]:
+    """The organization's holidays; an entry that is not an ISO date is skipped (the database's column type makes that impossible)."""
+    raw = org_row.get("fintech_holidays") if isinstance(org_row, dict) else None
+    out: set[date] = set()
+    for value in raw if isinstance(raw, list) else []:
+        try:
+            out.add(value if isinstance(value, date) else date.fromisoformat(str(value)))
+        except ValueError:
+            continue
+    return sorted(out)[:60]
+LOOP_RULE_ID = "RAD-LOOP-001"
+# The agent columns the context reads, and only those: the full row (every column) used to be fetched on every passport cache miss.
+AGENT_CONTEXT_COLUMNS = (
+    "status, expires_at, scopes, version, safe_mode, daily_call_limit, budget_action, last_seen_at, destination_mode, reported_only, spend_limit_micro_usd"
+)
+
+
+def _bounded_int(value: Any, low: int, high: int, default: int) -> int:
+    """A stored setting that is a plain integer inside its bounds, else the default (a bool is not an integer here)."""
+    if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high:
+        return value
+    return default
+
+
+def _last_seen_is_stale(value: Any, now: datetime) -> bool:
+    """True when the stored last-seen time is missing, unreadable, in the future or at least a minute old."""
+    if not value:
+        return True
+    try:
+        seen = parse_timestamp(value)
+    except (TypeError, ValueError):
+        return True
+    age = (now - seen).total_seconds()
+    return age < 0 or age >= LAST_SEEN_WRITE_INTERVAL_SECONDS
+
+
+@router.get(
+    "/internal/v1/gateway-context",
+    response_model=GatewayContextResponse,
+    dependencies=[Depends(require_internal_service)],
+    include_in_schema=False,
+)
+async def gateway_context(
+    supabase: SupabaseDep,
+    agent_id: UUID,
+    organization_id: UUID,
+    server: Annotated[str, Query(pattern=SERVER_SLUG_PATTERN)],
+    instance_id: Annotated[str | None, Query(pattern=r"^[A-Za-z0-9-]{8,64}$")] = None,
+) -> GatewayContextResponse:
+    """
+    Everything the gateway needs to authorize one call: the passport's current status,
+    version and scopes, and the upstream URL of the requested MCP server in that tenant.
+    Malformed stored data yields status 'revoked' so the gateway denies (fail closed).
+    """
+    # The lookups below do not depend on each other, so they run together: one round trip of waiting instead of about eight
+    # (measured on staging: this endpoint took ~230 ms typical, and the gateway waits for it whenever its short cache expires).
+    # Failure behaviour is unchanged: a failed bait lookup, pin lookup or usage lookup is a 503 (the gateway denies).
+    async def load_honey() -> tuple[list[GatewayHoneytoken], list[GatewayHoneyTool]]:
+        try:
+            tokens_res = await (
+                supabase.table("honeytokens").select("id,digest")
+                .eq("organization_id", str(organization_id)).eq("status", "active").execute()
+            )
+            tools_res = await (
+                supabase.table("honey_tools").select("id,name,description")
+                .eq("organization_id", str(organization_id)).eq("agent_id", str(agent_id))
+                .eq("server_slug", server).eq("status", "active").execute()
+            )
+            return (
+                [GatewayHoneytoken(id=r["id"], digest=r["digest"]) for r in (tokens_res.data or [])],
+                [GatewayHoneyTool(id=r["id"], name=r["name"], description=r["description"]) for r in (tools_res.data or [])],
+            )
+        except Exception as exc:  # noqa: BLE001  without the bait list the gateway cannot decide, so it denies
+            logger.error("Honeytoken lookup failed: %s", type(exc).__name__)
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Honeytoken lookup failed.") from None
+
+    async def load_server() -> tuple[dict[str, Any] | None, Literal["off", "alert", "enforce"], list[GatewayApprovedTool]]:
+        server_res = await (
+            supabase.table("mcp_servers")
+            .select("id, slug, url, is_active, pin_mode")
+            .eq("organization_id", str(organization_id))
+            .eq("slug", server)
+            .eq("is_active", True)
+            .maybe_single()
+            .execute()
+        )
+        row = server_res.data if server_res else None
+        mode: Literal["off", "alert", "enforce"] = "enforce"  # anything unexpected is read the restrictive way
+        approved: list[GatewayApprovedTool] = []
+        if row:
+            if row.get("pin_mode") in ("off", "alert", "enforce"):
+                mode = row["pin_mode"]
+            if mode == "enforce":
+                try:
+                    pins_res = await (
+                        supabase.table("mcp_tool_pins").select("tool_name, digest")
+                        .eq("organization_id", str(organization_id)).eq("server_id", str(row["id"])).eq("status", "approved")
+                        .execute()
+                    )
+                    approved = [GatewayApprovedTool(tool=r["tool_name"], digest=r["digest"]) for r in (pins_res.data or [])]
+                except Exception as exc:  # noqa: BLE001  without the approved list the gateway cannot enforce, so it denies
+                    logger.error("Tool pin lookup failed: %s", type(exc).__name__)
+                    raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Tool pin lookup failed.") from None
+        return row, mode, approved
+
+    async def load_org() -> Any:
+        res = await (
+            supabase.table("organizations")
+            .select(
+                "safe_mode, utc_offset_minutes, payload_capture_enabled, radar_mode, output_check_mode, loop_mode, loop_limit, loop_window_seconds, "
+                "fintech_shield_mode, fintech_holidays"
+            )
+            .eq("id", str(organization_id)).maybe_single().execute()
+        )
+        return res.data if res else None
+
+    async def load_agent() -> Any:
+        res = await (
+            supabase.table("agents").select(AGENT_CONTEXT_COLUMNS).eq("id", str(agent_id)).eq("organization_id", str(organization_id))
+            .maybe_single().execute()
+        )
+        return res.data if res else None
+
+    async def load_allowed_destinations(row: Any) -> tuple[Literal["off", "observe", "enforce"], list[str]]:
+        """The agent's destination mode and, unless it is off, its allowed hosts. A missing mode is off (a row from before the feature); a
+        mode that is present but not one of the three is read as ENFORCE (the restrictive reading, as for Safe Mode). A failed list lookup is
+        a 503: the gateway cannot compare without the list, so the call is denied rather than checked against nothing."""
+        raw = row.get("destination_mode") if isinstance(row, dict) else None
+        mode: Literal["off", "observe", "enforce"] = "off" if raw is None else raw if raw in ("off", "observe", "enforce") else "enforce"
+        if mode == "off":
+            return mode, []
+        try:
+            res = await (
+                supabase.table("agent_destinations").select("host")
+                .eq("organization_id", str(organization_id)).eq("agent_id", str(agent_id)).limit(101).execute()
+            )
+        except Exception as exc:  # noqa: BLE001  without the list the gateway cannot decide, so it denies
+            logger.error("Destination list lookup failed: %s", type(exc).__name__)
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Destination list lookup failed.") from None
+        hosts = {h for h in (r.get("host") for r in (res.data or [])) if isinstance(h, str) and normalize_host(h) == h}
+        return mode, sorted(hosts)[:100]  # a stored entry that does not normalize to itself is dropped: fewer allowed, never more
+
+    async def load_loop_exempt() -> bool:
+        """True while a suppression of the loop rule is live for this agent. A failed lookup means NOT exempt, the restrictive reading
+        (the agent may be flagged or throttled that it should not be) instead of failing the whole lookup for a side question."""
+        try:
+            res = await (
+                supabase.table("radar_suppressions").select("revoked_at")
+                .eq("organization_id", str(organization_id)).eq("agent_id", str(agent_id)).eq("rule_id", LOOP_RULE_ID)
+                .gt("expires_at", utcnow().isoformat()).execute()
+            )
+            return any(r.get("revoked_at") is None for r in (res.data or []))
+        except Exception as exc:  # noqa: BLE001  see the docstring
+            logger.warning("Loop exemption lookup failed: %s", type(exc).__name__)
+            return False
+
+    agent, (server_row, pin_mode, approved_tools), org_row, (honeytokens, honey_tools), loop_exempt = await asyncio.gather(
+        load_agent(), load_server(), load_org(), load_honey(), load_loop_exempt()
+    )
+    if not agent:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Agent not found.")
+
+    now = utcnow()
+    try:
+        scopes = parse_scopes(agent.get("scopes", []))
+        expires_at = parse_timestamp(agent["expires_at"])
+        current: PassportStatus = effective_status(str(agent.get("status")), agent["expires_at"], now)
+    except (KeyError, TypeError, ValueError):
+        logger.error("Malformed passport data for agent %s; reporting revoked", agent_id)
+        scopes, expires_at, current = [], now, "revoked"
+    if current == "active" and agent.get("reported_only") is True:
+        # Defence in depth behind the token exchange (C1b): a reported-only passport is never active to the gateway. Reported as frozen, the
+        # reversible state, because promotion makes it usable.
+        current = "frozen"
+
+    # Safe Mode is on when the agent's flag OR the organization's flag is on. Anything that is not
+    # an explicit false (a missing row, null, a non-boolean) counts as ON: the restrictive reading.
+    safe_mode = not (
+        agent.get("safe_mode") is False and org_row is not None and org_row.get("safe_mode") is False
+    )
+
+    payload_capture = org_row is not None and org_row.get("payload_capture_enabled") is True
+    # A check only runs when the organization explicitly turned it on. Anything else (a missing row, null, an unknown value) is
+    # off: the checks only observe, so "off" never lets anything through that "observe" would have stopped.
+    radar_mode: Literal["off", "observe"] = "observe" if org_row is not None and org_row.get("radar_mode") == "observe" else "off"
+    output_check_mode: Literal["off", "observe"] = (
+        "observe" if org_row is not None and org_row.get("output_check_mode") == "observe" else "off"
+    )
+    # Loop detection only runs for an explicit "observe" or "throttle". Anything else (a missing row, null, an unknown value) is off, and
+    # a limit or window that is not a plain in-range integer falls back to the defaults (20 calls in 60 seconds, decision F-D4).
+    raw_loop_mode = org_row.get("loop_mode") if org_row is not None else None
+    loop_mode: Literal["off", "observe", "throttle"] = raw_loop_mode if raw_loop_mode in ("observe", "throttle") else "off"
+    loop_limit = _bounded_int(org_row.get("loop_limit") if org_row else None, 3, 1000, 20)
+    loop_window_seconds = _bounded_int(org_row.get("loop_window_seconds") if org_row else None, 10, 600, 60)
+    offset = budget_rules.normalize_offset(org_row.get("utc_offset_minutes") if org_row else None)
+    raw_limit = agent.get("daily_call_limit")
+    if raw_limit is None:
+        limit: int | None = None
+    elif isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit >= 1:
+        limit = raw_limit
+    else:
+        limit = 0  # malformed stored limit: the restrictive reading is "nothing is allowed"
+    day = budget_rules.local_day(now, offset)
+
+    async def load_used_by_others() -> int:
+        try:
+            others_res = await supabase.rpc(
+                "usage_by_others",
+                {"p_org": str(organization_id), "p_agent": str(agent_id), "p_day": day.isoformat(),
+                 "p_instance": instance_id or "unidentified-caller"},
+            ).execute()
+            return int(others_res.data or 0)
+        except Exception as exc:  # noqa: BLE001  without usage the gateway cannot decide, so it denies
+            logger.error("Usage lookup failed: %s", type(exc).__name__)
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Usage lookup failed.") from None
+
+    async def touch_last_seen() -> None:
+        """"Last seen" is for the dashboard only, so it is written at most once a minute per agent instead of on every lookup. A malformed
+        or missing value simply means "write now"."""
+        if _last_seen_is_stale(agent.get("last_seen_at"), now):
+            try:
+                await (
+                    supabase.table("agents")
+                    .update({"last_seen_at": now.isoformat()})
+                    .eq("id", str(agent_id))
+                    .eq("organization_id", str(organization_id))
+                    .execute()
+                )
+            except Exception as exc:  # noqa: BLE001  a dashboard-only write must never deny an authorization lookup
+                logger.warning("Last-seen update failed: %s", type(exc).__name__)
+
+    async def load_blocked_destinations() -> list[str]:
+        try:
+            ioc_res = await (
+                supabase.table("threat_intel_indicators")
+                .select("indicator_type, indicator_value")
+                .eq("organization_id", str(organization_id))
+                .limit(500)
+                .execute()
+            )
+        except Exception as exc:  # noqa: BLE001 - secondary feed must not crash core auth if table absent
+            logger.debug("Threat intel IOC lookup skipped: %s", type(exc).__name__)
+            return []
+        hosts: list[str] = []
+        for row in ioc_res.data or []:
+            if row.get("indicator_type") in ("domain", "ipv4"):
+                norm = normalize_host(str(row.get("indicator_value") or ""))
+                if norm and norm not in hosts:
+                    hosts.append(norm)
+        return hosts[:500]
+
+    async def load_fintech() -> GatewayFintechContext | None:
+        """The Fintech Shield block (Phase 6, ADR 0033), or None while the mode is off or the server is unknown. A missing mode is off (a row
+        from before the feature); a mode that is present but not one of the three is read as ENFORCE (the restrictive reading, as for the
+        destination mode). In enforce, a failed or malformed binding lookup is a 503 (the gateway denies rather than judge payments against
+        nothing). In observe it only means no block for this lookup: observe never refuses, so the lookup must not fail for it."""
+        raw = org_row.get("fintech_shield_mode") if isinstance(org_row, dict) else None
+        if raw is None or raw == "off" or not server_row:
+            return None
+        mode: Literal["observe", "enforce"] = "observe" if raw == "observe" else "enforce"
+        try:
+            res = await (
+                supabase.table("mcp_server_tool_bindings")
+                .select("tool, amount_path, currency_path, fixed_currency, beneficiary_path")
+                .eq("organization_id", str(organization_id)).eq("server_id", str(server_row["id"]))
+                .limit(MAX_FINTECH_BINDINGS_PER_SERVER + 1).execute()
+            )
+            bindings = [GatewayFintechBinding.model_validate(_checked_fintech_binding(r)) for r in (res.data or [])]
+        except Exception as exc:  # noqa: BLE001  see the docstring
+            if mode == "enforce":
+                logger.error("Fintech binding lookup failed: %s", type(exc).__name__)
+                raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Fintech binding lookup failed.") from None
+            logger.warning("Fintech binding lookup failed in observe; no block sent: %s", type(exc).__name__)
+            return None
+        return GatewayFintechContext(
+            mode=mode, holidays=_fintech_holidays(org_row), utc_offset_minutes=offset,
+            bindings=bindings[:MAX_FINTECH_BINDINGS_PER_SERVER],
+        )
+
+    # The destination list, the usage by other instances and the last-seen write do not depend on each other, so they run together
+    # (three round trips in a row on every cache miss before). Every failure still fails the whole lookup: the first HTTPException wins.
+    destinations_outcome, usage_outcome, blocked_outcome, _, fintech_outcome = await asyncio.gather(
+        load_allowed_destinations(agent), load_used_by_others(), load_blocked_destinations(), touch_last_seen(), load_fintech(),
+        return_exceptions=True,
+    )
+    for outcome in (destinations_outcome, usage_outcome, fintech_outcome):
+        if isinstance(outcome, BaseException):
+            raise outcome
+    if isinstance(destinations_outcome, BaseException) or isinstance(usage_outcome, BaseException):  # unreachable: narrowed for the type checker
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Context lookup failed.")
+    destination_mode, allowed_destinations = destinations_outcome
+    used_by_others = usage_outcome
+    blocked_destinations = [] if isinstance(blocked_outcome, BaseException) else blocked_outcome
+    budget = GatewayBudgetContext(
+        daily_call_limit=limit,
+        used_by_other_instances=used_by_others,
+        day_key=day,
+        resets_at=budget_rules.next_reset_utc(now, offset),
+        action="freeze" if agent.get("budget_action") == "freeze" else "deny",
+    )
+
+    model_spend = await spend_service.model_spend_context(supabase, organization_id, agent_id, agent.get("spend_limit_micro_usd"), day) if server == MODEL_SERVER_NAME else None
+
+    return GatewayContextResponse(
+        agent=GatewayAgentContext(
+            id=agent_id,
+            organization_id=organization_id,
+            status=current,
+            version=int(agent.get("version") or 1),
+            scopes=scopes,
+            expires_at=expires_at,
+            safe_mode=safe_mode,
+            payload_capture=payload_capture,
+            budget=budget,
+            honeytokens=honeytokens,
+            honey_tools=honey_tools,
+            radar_mode=radar_mode,
+            output_check_mode=output_check_mode,
+            loop_mode=loop_mode,
+            loop_limit=loop_limit,
+            loop_window_seconds=loop_window_seconds,
+            loop_exempt=loop_exempt,
+            destination_mode=destination_mode,
+            allowed_destinations=allowed_destinations,
+            blocked_destinations=blocked_destinations,
+            model_spend=model_spend,
+        ),
+        server=GatewayServerContext(
+            slug=server_row["slug"], url=server_row["url"], pin_mode=pin_mode, approved_tools=approved_tools
+        ) if server_row else None,
+        fintech=fintech_outcome if isinstance(fintech_outcome, GatewayFintechContext) else None,
+    )

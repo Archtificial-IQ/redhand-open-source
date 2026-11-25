@@ -1,0 +1,750 @@
+"""
+The RedHand MCP gateway: the enforcement point for Agent Passports.
+
+For every JSON-RPC message an agent sends to `/mcp/{server}`:
+  1. authenticate the agent's access token (signature, audience, expiry)
+  2. load the passport context from core (status, scopes, upstream URL; cached <= 2 s)
+  3. deny unless the passport is active and the server is registered in the tenant
+  4. allow only the MCP methods Phase 1 governs; for tools/call require a matching scope
+     and pass the optional argument guardrails
+  5. forward to the customer's MCP server, filter tools/list to permitted tools, redact
+     secrets from tool results, and record the decision
+
+Every error path denies. Nothing here calls an LLM or does unbounded work.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+import json
+import time
+from typing import Any
+from uuid import UUID, uuid4
+
+import structlog
+
+from ..firewall.engine import FirewallPolicyEngine
+from .digest import argument_keys, digest_arguments
+from .context import AgentUnknownError, ContextUnavailableError, CoreContextClient, GatewayContext
+from .identity import AgentAuthError, AgentIdentity, AgentTokenVerifier, KeyUnavailableError
+from .budget import BudgetMeter
+from .metrics import GatewayMetrics
+from .capture import build_excerpt
+from ..firewall.destinations import blocked_hits, disallowed, scan_arguments
+from .honeytokens import scan as scan_honeytokens
+from .loops import LoopDecision, LoopMeter
+from .pin_check import FirstUseChecker
+from .pins import PinCoordinator
+from .radar_scan import RadarScanner, kinds_for
+from .recorder import EventRecorder, GatewayEvent
+from .trips import Trip, TripDispatcher
+from .upstream import DestinationBlockedError, UpstreamError, UpstreamForwarder
+
+logger = structlog.get_logger(__name__)
+
+# Methods the Phase 1 gateway forwards. Resources and prompts can expose data outside the
+# tool scopes a passport describes, so they are refused until scopes cover them.
+ALLOWED_METHODS = frozenset(
+    {
+        "initialize",
+        "ping",
+        "tools/list",
+        "tools/call",
+        "notifications/initialized",
+        "notifications/cancelled",
+    }
+)
+
+BUDGET_REFUSAL_LOG_INTERVAL_SECONDS = 60.0
+
+JSONRPC_INVALID_REQUEST = -32600
+JSONRPC_METHOD_NOT_FOUND = -32601
+JSONRPC_INVALID_PARAMS = -32602
+JSONRPC_POLICY_VIOLATION = -32000
+JSONRPC_PASSPORT_INACTIVE = -32001
+JSONRPC_UPSTREAM_UNAVAILABLE = -32002
+JSONRPC_GATEWAY_UNAVAILABLE = -32003
+JSONRPC_UNKNOWN_SERVER = -32004
+JSONRPC_UNAUTHORIZED = -32005
+
+
+@dataclass(slots=True)
+class GatewayResponse:
+    status_code: int
+    body: dict[str, Any] | None
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+def _error(request_id: Any, code: int, message: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+    err: dict[str, Any] = {"code": code, "message": message}
+    if data:
+        err["data"] = data
+    return {"jsonrpc": "2.0", "id": request_id, "error": err}
+
+
+class McpGateway:
+    def __init__(
+        self,
+        *,
+        verifier: AgentTokenVerifier,
+        contexts: CoreContextClient,
+        forwarder: UpstreamForwarder,
+        firewall: FirewallPolicyEngine,
+        metrics: GatewayMetrics,
+        budget: BudgetMeter,
+        recorder: EventRecorder,
+        trips: TripDispatcher,
+        pins: PinCoordinator,
+        radar: RadarScanner,
+        loops: LoopMeter | None = None,
+        loop_detection_enabled: bool = True,
+        destination_check_enabled: bool = True,
+        token_version_check_enabled: bool = True,
+        strict_pinning_enabled: bool = True,
+        redact_upstream_errors_enabled: bool = True,
+    ) -> None:
+        self.verifier = verifier
+        self.contexts = contexts
+        self.forwarder = forwarder
+        self.firewall = firewall
+        self.metrics = metrics
+        self.budget = budget
+        self.recorder = recorder
+        self.trips = trips
+        self.pins = pins
+        self.radar = radar
+        contexts.attach_metrics(metrics)
+        verifier.attach_metrics(metrics)
+        self._budget_refusal_logged: dict[UUID, float] = {}
+        # Loop detection (Phase 4 M6). `loop_detection_enabled` is the operator's kill switch: False skips the meter whatever core says.
+        self.loops = loops if loops is not None else LoopMeter()
+        self.loop_detection_enabled = loop_detection_enabled
+        self._loop_refusal_logged: dict[UUID, float] = {}
+        self._loop_evictions_seen = 0
+        # Destination allowlist (Phase 4 M7). `destination_check_enabled` is the operator's kill switch: False skips the check whatever core says.
+        self.destination_check_enabled = destination_check_enabled
+        # Stale-token check (H4.1). `token_version_check_enabled` is the operator's kill switch: False accepts a token older than the passport
+        # again (the pre-H4 behaviour); the passport's current status and scopes still decide every call.
+        self.token_version_check_enabled = token_version_check_enabled
+        # Strict pinning (H4.2). `strict_pinning_enabled` is the operator's kill switch: False judges a tool this process never saw listed by
+        # name alone again (the pre-H4 behaviour). True fetches the server's tool list on first use (agentwall/src/gateway/pin_check.py).
+        self.strict_pinning_enabled = strict_pinning_enabled
+        self._first_use = FirstUseChecker(pins=pins, metrics=metrics)
+        # Upstream errors (H4.3). `redact_upstream_errors_enabled` is the operator's kill switch: False passes a JSON-RPC error from the server
+        # through untouched again (secrets and bait in it then reach the agent). True treats an error like a result.
+        self.redact_upstream_errors_enabled = redact_upstream_errors_enabled
+        self._destination_refusal_logged: dict[UUID, float] = {}
+
+    def _record_budget_refusal(
+        self, identity: AgentIdentity, context: GatewayContext, method: str | None, message: Any,
+        reasons: list[str], tool_name: str, arguments: dict[str, Any], started: float,
+    ) -> None:
+        """
+        A runaway agent retrying over its limit gets the FULL Black Box row (argument digest and, when the organization turned capture on, a
+        payload excerpt) once per agent per minute; every other refusal in between is still counted in the metrics AND still reaches the
+        Black Box as a slim row without those (see `_record_repeat_refusal`), so no refusal is missing from the durable record.
+        """
+        self._record_repeat_refusal(
+            self._budget_refusal_logged, identity, context, method, message, reasons, tool_name, arguments, started,
+        )
+
+    def _record_repeat_refusal(
+        self, logged: dict[UUID, float], identity: AgentIdentity, context: GatewayContext, method: str | None, message: Any,
+        reasons: list[str], tool_name: str, arguments: dict[str, Any], started: float,
+    ) -> None:
+        """The once-a-minute limit on the FULL row (digest and payload excerpt) shared by every refusal an agent can repeat (budget, loop,
+        destination). `logged` is that refusal's own table, so one kind of refusal cannot silence another's full row. Every refusal reaches the Black Box."""
+        now = time.monotonic()
+        last = logged.get(identity.agent_id)
+        if last is None or now - last >= BUDGET_REFUSAL_LOG_INTERVAL_SECONDS:
+            logged[identity.agent_id] = now
+            self._record(identity, context, method, message, "BLOCK", reasons, 403, tool_name, arguments, started)
+        else:
+            self.recorder.record(self._event(identity, context, method, "BLOCK", reasons, 403, tool_name, started))
+
+    def _destination_check(
+        self, identity: AgentIdentity, context: GatewayContext, tool_name: str, arguments: dict[str, Any],
+    ) -> tuple[tuple[str, ...], bool] | None:
+        """
+        The addresses in this call's arguments that are not on the agent's list (as coarse names) and whether part of the call was past the
+        scan budget. None when the check itself failed (counted and logged without values): the caller decides what that means. Never raises.
+        Raises no DNS or other I/O: it only reads what the agent wrote.
+        """
+        try:
+            scan = scan_arguments(arguments)
+            offending = disallowed(scan, context.allowed_destinations)
+        except Exception as exc:  # noqa: BLE001  the caller decides what an error means
+            logger.error("Destination check failed", error_type=type(exc).__name__)
+            self.metrics.record_destination("error")
+            return None
+        if offending:
+            self.metrics.record_destination("flagged")
+            self.radar.report_finding(
+                organization_id=identity.organization_id, agent_id=identity.agent_id, server=context.server_slug, tool=tool_name,
+                rule_id="RAD-DST-001", kind="destination", family="destination", severity="high", detail=offending[0],
+                on_throttled=lambda: self.metrics.record_destination("report_throttled"),
+            )
+        elif scan.untracked:
+            self.metrics.record_destination("untracked")
+        else:
+            self.metrics.record_destination("ok")
+        return offending, scan.untracked
+
+    def _loop_check(
+        self, identity: AgentIdentity, context: GatewayContext, tool_name: str, arguments: dict[str, Any], throttle: bool,
+    ) -> LoopDecision | None:
+        """
+        Counts this call. Returns the decision, or None when the meter raised (counted and logged without values). Never raises:
+        the caller decides what an error means (observe: carry on; throttle: deny).
+        """
+        try:
+            decision = self.loops.check(
+                identity.agent_id, tool_name, arguments, limit=context.loop_limit, window_seconds=float(context.loop_window_seconds),
+                throttle=throttle,
+            )
+        except Exception as exc:  # noqa: BLE001  the caller decides what an error means
+            logger.error("Loop check failed", error_type=type(exc).__name__)
+            self.metrics.record_loop("error")
+            return None
+        evicted = self.loops.evictions - self._loop_evictions_seen
+        if evicted:
+            self._loop_evictions_seen = self.loops.evictions
+            self.metrics.record_loop("evicted", evicted)
+        self.metrics.record_loop(decision.outcome)
+        if decision.flagged:
+            self.radar.report_loop(
+                organization_id=identity.organization_id, agent_id=identity.agent_id, server=context.server_slug, tool=tool_name,
+            )
+        return decision
+
+    async def handle(
+        self,
+        *,
+        server: str,
+        message: Any,
+        bearer_token: str | None,
+        client_headers: dict[str, str],
+        upstream_authorization: str | None,
+    ) -> GatewayResponse:
+        """
+        Decides one message and forwards it if allowed. On the enforcement path any unexpected error is a deny (CLAUDE.md 6.2): whatever
+        goes wrong inside, the caller gets a generic JSON-RPC error (no type, no text, no stack), never an unhandled exception and an
+        HTTP 500, and the failure is logged by type only and counted.
+        """
+        try:
+            return await self._handle(
+                server=server, message=message, bearer_token=bearer_token, client_headers=client_headers,
+                upstream_authorization=upstream_authorization,
+            )
+        except Exception as exc:  # noqa: BLE001  enforcement path: an unexpected error denies
+            logger.error("Gateway request failed unexpectedly", error_type=type(exc).__name__)
+            self.metrics.record(method="other", outcome="error", reason="internal_error", overhead_ms=0.0)
+            request_id = message.get("id") if isinstance(message, dict) else None
+            return GatewayResponse(503, _error(request_id, JSONRPC_GATEWAY_UNAVAILABLE, "The gateway could not process this request."))
+
+    async def _handle(
+        self,
+        *,
+        server: str,
+        message: Any,
+        bearer_token: str | None,
+        client_headers: dict[str, str],
+        upstream_authorization: str | None,
+    ) -> GatewayResponse:
+        started = time.perf_counter()
+        self.recorder.schedule_flush_if_due()  # synchronous, no I/O: starts a background flush at most
+        request_id = message.get("id") if isinstance(message, dict) else None
+        method = message.get("method") if isinstance(message, dict) else None
+        method_label = method if method in ALLOWED_METHODS else "other"
+
+        def deny(status: int, code: int, text: str, reason: str, data: dict[str, Any] | None = None) -> GatewayResponse:
+            self.metrics.record(
+                method=method_label, outcome="deny", reason=reason,
+                overhead_ms=(time.perf_counter() - started) * 1000,
+            )
+            headers = {"WWW-Authenticate": 'Bearer realm="redhand-gateway"'} if status == 401 else {}
+            return GatewayResponse(status, _error(request_id, code, text, data), headers)
+
+        # 1. Agent authentication
+        if not bearer_token:
+            return deny(401, JSONRPC_UNAUTHORIZED, "Agent access token required.", "missing_token")
+        verify_timer = time.perf_counter()
+        try:
+            identity = await self.verifier.verify(bearer_token)
+        except KeyUnavailableError:
+            return deny(503, JSONRPC_GATEWAY_UNAVAILABLE, "Gateway cannot verify tokens right now.", "keys_unavailable")
+        except AgentAuthError:
+            return deny(401, JSONRPC_UNAUTHORIZED, "Invalid or expired agent access token.", "invalid_token")
+        self.metrics.record_stage("verify", (time.perf_counter() - verify_timer) * 1000)
+
+        # 2. Message shape
+        if not isinstance(message, dict) or message.get("jsonrpc") != "2.0" or not isinstance(method, str):
+            return deny(400, JSONRPC_INVALID_REQUEST, "Invalid JSON-RPC 2.0 message.", "invalid_message")
+
+        # 3. Passport and server context
+        try:
+            context = await self.contexts.get(identity.agent_id, identity.organization_id, server)
+        except AgentUnknownError:
+            return deny(401, JSONRPC_UNAUTHORIZED, "Agent is not registered.", "unknown_agent")
+        except ContextUnavailableError:
+            return deny(503, JSONRPC_GATEWAY_UNAVAILABLE, "Passport service unavailable; request denied.", "context_unavailable")
+
+        if context.status != "active":
+            self._record(identity, context, method, message, "BLOCK", [f"passport_{context.status}"], 403, started=started)
+            return deny(
+                403, JSONRPC_PASSPORT_INACTIVE, f"Agent passport is {context.status}.",
+                f"passport_{context.status}", {"passport_status": context.status},
+            )
+        # A token issued for an older passport version is refused, so a token from before a freeze, an expiry change or a scope change cannot
+        # come back to life afterwards (an unfreeze makes the passport active again). Only an OLDER token is stale: a newer one means this
+        # gateway's cached context lags a change by at most its TTL, which already bounds every other decision.
+        if self.token_version_check_enabled and identity.passport_version < context.passport_version:
+            self._record(identity, context, method, message, "BLOCK", ["token_stale"], 401, started=started)
+            return deny(401, JSONRPC_UNAUTHORIZED, "Agent access token is out of date. Request a new one.", "token_stale")
+        if context.server_url is None:
+            return deny(404, JSONRPC_UNKNOWN_SERVER, f"Unknown MCP server '{server}'.", "unknown_server")
+        if method not in ALLOWED_METHODS:
+            return deny(200, JSONRPC_METHOD_NOT_FOUND, f"Method '{method}' is not permitted through the RedHand gateway.", "method_not_allowed")
+
+        # 4. Tool authorization
+        tool_name = ""
+        arguments: dict[str, Any] = {}
+        if method == "tools/call":
+            params = message.get("params")
+            if not isinstance(params, dict) or not isinstance(params.get("name"), str) or not params["name"]:
+                return deny(200, JSONRPC_INVALID_PARAMS, "tools/call requires params.name.", "invalid_params")
+            raw_args = params.get("arguments", {})
+            if not isinstance(raw_args, dict):
+                return deny(200, JSONRPC_INVALID_PARAMS, "tools/call arguments must be an object.", "invalid_params")
+            tool_name, arguments = params["name"], raw_args
+
+            # 4a. Honeytokens and decoy tools come first: a call carrying planted bait, or to a decoy, is a trip
+            # however the passport is scoped, and neither is ever forwarded upstream. The tool NAME is scanned
+            # along with the arguments (names and argument keys can carry bait too), and a trip is recorded,
+            # logged and reported with the redacted copies, so the bait itself never reaches an event or a log.
+            bait_timer = time.perf_counter()
+            try:
+                bait = scan_honeytokens({"tool": tool_name, "arguments": arguments}, context.honeytokens)
+                self.metrics.record_stage("honeytoken_scan", (time.perf_counter() - bait_timer) * 1000)
+            except Exception as exc:  # noqa: BLE001  enforcement path: a scanner error denies
+                logger.error("Honeytoken scan failed", error_type=type(exc).__name__)
+                self._record(identity, context, method, message, "BLOCK", ["honeytoken scan failed"], 403, "", {}, started, capture=False)
+                return deny(200, JSONRPC_POLICY_VIOLATION, "PolicyViolation: request could not be checked.", "honeytoken_scan_error")
+            if bait.truncated:
+                self.metrics.record_honeytoken_scan_truncated()
+            if bait.matched:
+                safe_tool, safe_arguments = bait.value["tool"], bait.value["arguments"]
+                for honeytoken_id in bait.matched:
+                    self._trip(identity, context, "honeytoken", honeytoken_id, "arguments", safe_tool)
+                self._record(identity, context, method, message, "BLOCK", ["honeytoken"], 403, safe_tool, safe_arguments, started, capture=False)
+                return deny(200, JSONRPC_POLICY_VIOLATION, "PolicyViolation: request blocked.", "honeytoken")
+            decoy = context.honey_tool(tool_name)
+            if decoy is not None:
+                self._trip(identity, context, "honey_tool", decoy.id, "call", tool_name)
+                self._record(identity, context, method, message, "BLOCK", ["honey_tool"], 403, tool_name, arguments, started, capture=False)
+                self.metrics.record(
+                    method=method_label, outcome="deny", reason="honey_tool",
+                    overhead_ms=(time.perf_counter() - started) * 1000,
+                )
+                # Plausible, so an attacker does not learn the tool is bait: a generic tool error.
+                return GatewayResponse(200, {
+                    "jsonrpc": "2.0", "id": request_id,
+                    "result": {"content": [{"type": "text", "text": "The service is temporarily unavailable. Try again later."}], "isError": True},
+                })
+
+            if not context.allows_tool(tool_name):
+                if context.safe_mode and context.covers_tool(tool_name):
+                    reasons = [f"Safe Mode is on: tool '{tool_name}' on server '{server}' is not declared read-only."]
+                    self._record(identity, context, method, message, "BLOCK", reasons, 403, tool_name, arguments, started)
+                    return deny(200, JSONRPC_POLICY_VIOLATION, f"PolicyViolation: Safe Mode is on and tool '{tool_name}' is not read-only.",
+                                "safe_mode", {"tool_name": tool_name, "violations": reasons})
+                reasons = [f"Tool '{tool_name}' on server '{server}' is not in this agent's passport scopes."]
+                self._record(identity, context, method, message, "BLOCK", reasons, 403, tool_name, arguments, started)
+                return deny(200, JSONRPC_POLICY_VIOLATION, f"PolicyViolation: tool '{tool_name}' is out of scope.",
+                            "out_of_scope", {"tool_name": tool_name, "violations": reasons})
+
+            if context.pin_mode == "enforce" and not await self._pin_allows(identity, context, tool_name, upstream_authorization):
+                reasons = [f"Tool '{tool_name}' on server '{server}' is not approved: its current version has not been reviewed."]
+                self.metrics.record_pin_event("refused")
+                self._record(identity, context, method, message, "BLOCK", reasons, 403, tool_name, arguments, started)
+                return deny(200, JSONRPC_POLICY_VIOLATION, f"PolicyViolation: tool '{tool_name}' is not approved.",
+                            "tool_unapproved", {"tool_name": tool_name, "violations": reasons})
+
+            guard_timer = time.perf_counter()
+            violations = self.firewall.inspect_arguments(tool_name, arguments)
+            self.metrics.record_stage("guardrails", (time.perf_counter() - guard_timer) * 1000)
+            if violations:
+                self._record(identity, context, method, message, "BLOCK", violations, 403, tool_name, arguments, started)
+                return deny(200, JSONRPC_POLICY_VIOLATION, f"PolicyViolation: tool '{tool_name}' blocked by guardrails.",
+                            "guardrail", {"tool_name": tool_name, "violations": violations})
+
+            # 4a-ioc. Synced Threat Intel IOCs (TAXII 2.1): any call containing a known malicious domain/IPv4 is refused immediately.
+            if context.blocked_destinations:
+                ioc_hits = blocked_hits(scan_arguments(arguments), context.blocked_destinations)
+                if ioc_hits:
+                    reasons = [f"Destination matched synced Threat Intel IOC blocklist: {', '.join(ioc_hits)}."]
+                    self._record(identity, context, method, message, "BLOCK", reasons, 403, tool_name, arguments, started)
+                    return deny(
+                        200,
+                        JSONRPC_POLICY_VIOLATION,
+                        "PolicyViolation: destination matches synced threat intelligence indicator.",
+                        "threat_intel_ioc_blocked",
+                        {"tool_name": tool_name, "indicators": list(ioc_hits)},
+                    )
+
+            # 4a. Destination allowlist (Phase 4 M7): the web and email addresses the agent wrote into this call, against its list. Observe records
+            # a finding and carries on; enforce also refuses the call, and refuses what it could not check (arguments past the scan budget), so a
+            # call is never allowed on the strength of text that was not read. A check error denies in enforce and changes nothing in observe. Off
+            # for everyone with the kill switch, and for an agent whose mode is off. Refused before the loop check and Budget Guard, so it uses neither.
+            if self.destination_check_enabled and context.destination_mode != "off":
+                enforce = context.destination_mode == "enforce"
+                dest_timer = time.perf_counter()
+                verdict = self._destination_check(identity, context, tool_name, arguments)
+                self.metrics.record_stage("destination_check", (time.perf_counter() - dest_timer) * 1000)
+                if verdict is None and enforce:  # enforcement path: a check error denies
+                    self._record(identity, context, method, message, "BLOCK", ["destination check failed"], 403, tool_name, arguments, started)
+                    return deny(200, JSONRPC_POLICY_VIOLATION, "PolicyViolation: request could not be checked.", "destination_check_error")
+                if verdict is not None and enforce and (verdict[0] or verdict[1]):
+                    offending, untracked = verdict
+                    self.metrics.record_destination("refused")
+                    if offending:
+                        reasons = [f"An address in this call is not on this agent's allowed list: {', '.join(offending)}."]
+                        text, why = "PolicyViolation: this call contains an address that is not on this agent's allowed list.", "destination_not_allowed"
+                    else:
+                        reasons = ["Part of this call was too large to check against this agent's allowed list, so it was refused."]
+                        text, why = "PolicyViolation: this call is too large to check against this agent's allowed list.", "destination_untracked"
+                    self._record_repeat_refusal(
+                        self._destination_refusal_logged, identity, context, method, message, reasons, tool_name, arguments, started,
+                    )
+                    return deny(200, JSONRPC_POLICY_VIOLATION, text, why, {"tool_name": tool_name})
+
+            # 4a'. Loop detection (Phase 4 M6): the same agent, tool and arguments again and again. Only calls that would be forwarded
+            # are counted, and a refused repeat is refused before it can use budget. Off for the whole gateway with the kill switch, off
+            # for an organization in its settings, and skipped for an agent with a live suppression of the loop rule.
+            if self.loop_detection_enabled and context.loop_mode != "off" and not context.loop_exempt:
+                throttle = context.loop_mode == "throttle"
+                loop_timer = time.perf_counter()
+                loop = self._loop_check(identity, context, tool_name, arguments, throttle)
+                self.metrics.record_stage("loop_check", (time.perf_counter() - loop_timer) * 1000)
+                if loop is None and throttle:  # enforcement path: a meter error denies
+                    self._record(identity, context, method, message, "BLOCK", ["loop check failed"], 403, tool_name, arguments, started)
+                    return deny(200, JSONRPC_POLICY_VIOLATION, "PolicyViolation: request could not be checked.", "loop_check_error")
+                if loop is not None and loop.flagged and throttle:
+                    self.metrics.record_loop("throttled")
+                    reasons = [
+                        f"This exact call was repeated {loop.count} times within {context.loop_window_seconds} seconds "
+                        f"(limit {context.loop_limit}); further repeats are paused for now."
+                    ]
+                    self._record_repeat_refusal(
+                        self._loop_refusal_logged, identity, context, method, message, reasons, tool_name, arguments, started,
+                    )
+                    return deny(
+                        200, JSONRPC_POLICY_VIOLATION,
+                        f"PolicyViolation: this exact call was repeated too often (limit {context.loop_limit} in {context.loop_window_seconds} seconds) and is paused for now.",
+                        "loop_throttled",
+                        {"tool_name": tool_name, "loop_limit": context.loop_limit, "loop_window_seconds": context.loop_window_seconds},
+                    )
+
+            # 4b. Budget Guard: a call that is otherwise allowed consumes one unit of the agent's daily
+            # limit, or is refused. Refused calls above never reach this point, so they never consume.
+            budget_timer = time.perf_counter()
+            decision = self.budget.try_consume(identity.agent_id, context.budget)
+            if not decision.allowed:
+                limit = context.budget.daily_call_limit
+                resets = context.budget.resets_at.isoformat()
+                if decision.reason == "meter_full":
+                    reasons = ["The gateway cannot track this agent's usage right now; the call was refused."]
+                    text = "PolicyViolation: the gateway cannot track this agent's usage right now."
+                    why = "budget_untracked"
+                else:
+                    reasons = [f"Daily limit of {limit} tool calls reached ({decision.used} used); resets at {resets}."]
+                    text = f"PolicyViolation: daily limit of {limit} tool calls reached; it resets at {resets}."
+                    why = "budget_exceeded"
+                self._record_budget_refusal(identity, context, method, message, reasons, tool_name, arguments, started)
+                return deny(
+                    200, JSONRPC_POLICY_VIOLATION, text, why,
+                    {"tool_name": tool_name, "daily_call_limit": limit, "used": decision.used, "resets_at": resets},
+                )
+            self.budget.schedule_flush_if_due()
+            self.metrics.record_stage("budget", (time.perf_counter() - budget_timer) * 1000)
+            if decision.urgent:
+                flush_timer = time.perf_counter()
+                await self.budget.flush_now()
+                self.metrics.record_stage("budget_flush_now", (time.perf_counter() - flush_timer) * 1000)
+
+        overhead_ms = (time.perf_counter() - started) * 1000
+
+        # 5. Forward
+        try:
+            result = await self.forwarder.send(
+                url=context.server_url,
+                message=message,
+                client_headers=client_headers,
+                upstream_authorization=upstream_authorization,
+            )
+        except UpstreamError as exc:
+            reason = "destination_blocked" if isinstance(exc, DestinationBlockedError) else "upstream_error"
+            if method == "tools/call":
+                self._record(identity, context, method, message, "ERROR", [str(exc)], 502, tool_name, arguments, started)
+            self.metrics.record(method=method_label, outcome="error", reason=reason, overhead_ms=overhead_ms)
+            if request_id is None:
+                return GatewayResponse(502, None)
+            return GatewayResponse(502, _error(request_id, JSONRPC_UPSTREAM_UNAVAILABLE, str(exc)))
+        finally:
+            # However the forward ended, start a passport refresh if the entry has aged while the call was open upstream, so a slow
+            # tool does not leave the agent's next call waiting for core. Synchronous, no I/O, never raises.
+            self.contexts.refresh_if_ageing(identity.agent_id, identity.organization_id, server)
+
+        body = result.message
+        findings: list[str] = []
+        trip_reasons: list[str] = []
+        result_size_bytes: int | None = None
+        captured_result: Any = None
+        if body is not None and "result" in body:
+            if method == "tools/list":
+                body = self._filter_tool_list(body, context)
+                if context.pin_mode != "off":
+                    pinned = self._apply_pins(identity, context, body)
+                    if pinned is None:  # enforce mode could not check the list: show nothing rather than unchecked tools
+                        return deny(200, JSONRPC_GATEWAY_UNAVAILABLE, "The tool list could not be checked.", "pin_check_failed")
+                    body = pinned
+                body = self._add_honey_tools(body, context)
+            elif method == "tools/call":
+                upstream_result = body["result"]
+                try:
+                    bait = scan_honeytokens(upstream_result, context.honeytokens)
+                except Exception as exc:  # noqa: BLE001  the call already ran; a scanner error must not leak the result
+                    logger.error("Honeytoken scan failed", error_type=type(exc).__name__)
+                    self._record(identity, context, method, message, "BLOCK", ["honeytoken scan failed"], 403, tool_name, arguments, started, capture=False)
+                    return deny(200, JSONRPC_POLICY_VIOLATION, "PolicyViolation: result could not be checked.", "honeytoken_scan_error")
+                if bait.truncated:
+                    self.metrics.record_honeytoken_scan_truncated()
+                if bait.matched:
+                    # The agent READ planted bait. The result goes back with the bait redacted (refusing would
+                    # tip off an attacker that this record is special); core alerts or freezes per the stored action.
+                    for honeytoken_id in bait.matched:
+                        self._trip(identity, context, "honeytoken", honeytoken_id, "result", tool_name)
+                    upstream_result = bait.value
+                    trip_reasons = ["honeytoken"]
+                redacted, findings = self.firewall.inspect_egress(upstream_result)
+                if findings:
+                    logger.warning("Secrets redacted from tool result", count=len(findings), tool=tool_name)
+                self._observe_result(identity, context, tool_name, redacted)
+                body = {**body, "result": redacted}
+                captured_result = redacted
+                try:
+                    result_size_bytes = len(json.dumps(redacted, default=str))
+                except (TypeError, ValueError):
+                    result_size_bytes = None
+
+        if body is not None and "error" in body and self.redact_upstream_errors_enabled:
+            # An error from the server is untrusted text like a result: a credential or a stack trace in its message or data, or a planted bait
+            # value, must not reach the agent. Same checks as a result, same fail-closed rule when the scanner breaks.
+            upstream_error = body["error"]
+            if method == "tools/call":
+                try:
+                    error_bait = scan_honeytokens(upstream_error, context.honeytokens)
+                except Exception as exc:  # noqa: BLE001  the call already ran; a scanner error must not leak the error text
+                    logger.error("Honeytoken scan failed", error_type=type(exc).__name__)
+                    self._record(identity, context, method, message, "BLOCK", ["honeytoken scan failed"], 403, tool_name, arguments, started, capture=False)
+                    return deny(200, JSONRPC_POLICY_VIOLATION, "PolicyViolation: result could not be checked.", "honeytoken_scan_error")
+                if error_bait.truncated:
+                    self.metrics.record_honeytoken_scan_truncated()
+                if error_bait.matched:
+                    for honeytoken_id in error_bait.matched:
+                        self._trip(identity, context, "honeytoken", honeytoken_id, "result", tool_name)
+                    upstream_error = error_bait.value
+                    trip_reasons = ["honeytoken"]
+            redacted_error, error_findings = self.firewall.inspect_egress(upstream_error)
+            if error_findings:
+                logger.warning("Secrets redacted from upstream error", count=len(error_findings), method=method_label)
+            findings = [*findings, *error_findings]
+            body = {**body, "error": redacted_error}
+
+        if method == "tools/call":
+            self._record(
+                identity, context, method, message, "ALLOW", trip_reasons, result.status_code, tool_name, arguments, started,
+                result_size_bytes=result_size_bytes, redaction_count=len(findings), result=captured_result,
+                capture=not trip_reasons,
+            )
+        self.metrics.record(method=method_label, outcome="allow", reason="ok", overhead_ms=overhead_ms)
+        if body is None:
+            return GatewayResponse(202, None, result.headers)
+        return GatewayResponse(200, body, result.headers)
+
+    def _observe_result(self, identity: AgentIdentity, context: GatewayContext, tool_name: str, result: Any) -> None:
+        """
+        Hands the (already redacted) result to the Radar's background queue. Observe only: this never changes the result, never
+        waits and never raises, so a scanner problem cannot affect the call (docs/adr/0015-radar-in-the-gateway.md).
+        """
+        kinds = kinds_for(context.radar_mode, context.output_check_mode)
+        if not kinds:
+            return
+        self.radar.submit(
+            organization_id=identity.organization_id, agent_id=identity.agent_id, server=context.server_slug, tool=tool_name,
+            tool_names=frozenset(s.tool for s in context.scopes if s.server == context.server_slug and s.tool != "*"),
+            kinds=kinds, result=result,
+        )
+
+    def _trip(
+        self, identity: AgentIdentity, context: GatewayContext, kind: str, ref_id: UUID, seen_in: str, tool_name: str
+    ) -> None:
+        """Counts a trip and reports it to core without waiting. Never logs the value (there is none here)."""
+        self.metrics.record_trip(kind, seen_in)
+        logger.warning("Trip", kind=kind, seen_in=seen_in, agent_id=str(identity.agent_id), tool=tool_name)
+        self.trips.report(Trip(
+            organization_id=identity.organization_id, trip_id=uuid4(), agent_id=identity.agent_id,
+            kind=kind,  # type: ignore[arg-type]  # one of two literals chosen by the callers above
+            ref_id=ref_id,
+            seen_in=seen_in,  # type: ignore[arg-type]  # one of three literals chosen by the callers above
+            tool_name=tool_name, server=context.server_slug,
+        ))
+
+    def _apply_pins(self, identity: AgentIdentity, context: GatewayContext, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Hashes the listed tools, reports versions not yet reported, and in enforce mode keeps only tools whose current
+        version is approved. In alert mode a failure only counts (pinning is a side effect there); in enforce mode it
+        returns None so the caller shows no tools."""
+        result = body.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
+            return body
+        try:
+            tools = [t for t in result["tools"] if isinstance(t, dict) and isinstance(t.get("name"), str) and t["name"]]
+            digests = self.pins.observe(identity.organization_id, context.server_slug, tools)
+            if context.pin_mode != "enforce":
+                return body
+            kept = [t for t in result["tools"] if isinstance(t, dict) and (t.get("name"), digests.get(str(t.get("name")))) in context.approved_tools]
+            hidden = len(result["tools"]) - len(kept)
+            if hidden:
+                self.metrics.record_pin_event("hidden", hidden)
+            return {**body, "result": {**result, "tools": kept}}
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Tool pin check failed", error_type=type(exc).__name__)
+            self.metrics.record_pin_event("error")
+            return body if context.pin_mode != "enforce" else None
+
+    async def _pin_allows(
+        self, identity: AgentIdentity, context: GatewayContext, tool_name: str, upstream_authorization: str | None
+    ) -> bool:
+        """Enforce mode: a tool may be called if its name is approved and the CURRENT version of it is the approved one. A tool this process
+        has never seen listed is looked up first (H4.2): when that cannot be done the call is refused, never judged by name alone."""
+        if tool_name not in {name for name, _ in context.approved_tools}:
+            return False
+        last = self.pins.last_digest(identity.organization_id, context.server_slug, tool_name)
+        if last is None:
+            if not self.strict_pinning_enabled:
+                return True  # kill switch: the approved name is enough, as before H4
+            if context.server_url is None:
+                return False
+            last = await self._first_use.digest_for(
+                self.forwarder, identity.organization_id, context.server_slug, context.server_url, tool_name, upstream_authorization
+            )
+            if last is None:
+                return False
+        return (tool_name, last) in context.approved_tools
+
+    @staticmethod
+    def _add_honey_tools(body: dict[str, Any], context: GatewayContext) -> dict[str, Any]:
+        """Appends this agent's decoy tools to a tools/list result (never a duplicate of a real tool's name)."""
+        result = body.get("result")
+        if not context.honey_tools or not isinstance(result, dict) or not isinstance(result.get("tools"), list):
+            return body
+        names = {t.get("name") for t in result["tools"] if isinstance(t, dict)}
+        decoys = [
+            {"name": t.name, "description": t.description, "inputSchema": {"type": "object", "additionalProperties": True}}
+            for t in context.honey_tools if t.name not in names
+        ]
+        return {**body, "result": {**result, "tools": [*result["tools"], *decoys]}}
+
+    @staticmethod
+    def _filter_tool_list(body: dict[str, Any], context: GatewayContext) -> dict[str, Any]:
+        result = body.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
+            return body
+        permitted = [
+            t for t in result["tools"]
+            if isinstance(t, dict) and isinstance(t.get("name"), str) and context.allows_tool(t["name"])
+        ]
+        return {**body, "result": {**result, "tools": permitted}}
+
+    def _event(
+        self,
+        identity: AgentIdentity,
+        context: GatewayContext,
+        method: str | None,
+        decision: str,
+        reasons: list[str],
+        status: int,
+        tool_name: str,
+        started: float,
+        *,
+        result_size_bytes: int | None = None,
+        redaction_count: int = 0,
+    ) -> GatewayEvent:
+        """Builds the Black Box Recorder event for one decision. Never raises: every field here is
+        already validated or bounded upstream (CLAUDE.md §5.4), so building it is pure computation."""
+        return GatewayEvent(
+            agent_id=identity.agent_id,
+            organization_id=identity.organization_id,
+            occurred_at=datetime.now(timezone.utc).isoformat(),
+            server=context.server_slug,
+            method=str(method or ""),
+            tool_name=tool_name,
+            decision=decision,
+            reasons=reasons[:10],
+            upstream_status=status,
+            latency_ms=round((time.perf_counter() - started) * 1000, 2),
+            argument_keys=[],  # filled in by _record (names and digest)
+            result_size_bytes=result_size_bytes,
+            redaction_count=redaction_count,
+            credential_jti=identity.token_id,
+        )
+
+    def _record(
+        self,
+        identity: AgentIdentity,
+        context: GatewayContext,
+        method: str | None,
+        message: Any,
+        decision: str,
+        reasons: list[str],
+        status: int,
+        tool_name: str = "",
+        arguments: dict[str, Any] | None = None,
+        started: float | None = None,
+        *,
+        result_size_bytes: int | None = None,
+        redaction_count: int = 0,
+        result: Any = None,
+        capture: bool = True,
+    ) -> None:
+        # Every decision reaches the Black Box (core's per-organization, append-only, hash-chained record; ADR 0030): there is no second, local ledger.
+        # `started` is the call's start on the monotonic clock; a caller with none gets a latency of about zero.
+        event = self._event(
+            identity, context, method, decision, reasons, status, tool_name or str(method or ""),
+            time.perf_counter() if started is None else started,
+            result_size_bytes=result_size_bytes, redaction_count=redaction_count,
+        )
+        # Raw arguments are never stored (CLAUDE.md section 10): the Black Box row carries the names and a SHA-256 digest only.
+        args = arguments or {}
+        event = replace(event, argument_keys=argument_keys(args), arguments_sha256=digest_arguments(args))
+        # Never capture the payload of a trip: it may hold the bait itself, and the password format is
+        # not something the redaction patterns can recognise.
+        if context.payload_capture and capture:
+            event = self._with_payloads(event, arguments, result)
+        self.recorder.record(event)
+
+    def _with_payloads(self, event: GatewayEvent, arguments: dict[str, Any] | None, result: Any) -> GatewayEvent:
+        """Adds redacted, size-capped excerpts of the arguments and the (already secret-scrubbed) result.
+        Only called when the organization turned payload capture on. Never raises into the decision path:
+        a failure only means this event is recorded without a payload, and the failure is counted, not
+        logged with values (CLAUDE.md §5.2)."""
+        try:
+            args_excerpt = build_excerpt(arguments).as_dict() if arguments else None
+            result_excerpt = build_excerpt(result).as_dict() if result is not None else None
+        except Exception as exc:  # noqa: BLE001  capture is a side effect and must not affect enforcement
+            logger.warning("Payload capture failed", error_type=type(exc).__name__)
+            self.metrics.record_payload_capture("failed")
+            return event
+        self.metrics.record_payload_capture("ok")
+        return replace(event, arguments_redacted=args_excerpt, result_excerpt=result_excerpt)

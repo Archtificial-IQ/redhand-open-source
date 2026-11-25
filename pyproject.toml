@@ -1,0 +1,135 @@
+[project]
+name = "redhand-workspace"
+version = "0.1.0"
+description = "RedHand: open-source AI agent safety layer (kill switch, spend limits, action log, prompt injection detection)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "redhand-sdk",
+    "redhand-core",
+    "agentwall",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.3",
+    "pytest-asyncio>=0.24.0",
+]
+
+[tool.uv.sources]
+redhand-sdk = { workspace = true }
+redhand-core = { workspace = true }
+agentwall = { workspace = true }
+
+[tool.uv.workspace]
+members = [
+    "packages/redhand-sdk",
+    "services/redhand-core",
+    "agentwall",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["packages/redhand-sdk/tests", "services/redhand-core/tests", "agentwall/tests", "tests/e2e"]
+pythonpath = [".", "agentwall", "agentwall/src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Deliberately small: syntax errors (E9) and pyflakes (F: unused imports and variables,
+# undefined names). CI runs ruff with this file for every package (--config pyproject.toml).
+# Widen the rule set in its own change when the code base is ready for it.
+select = ["E9", "F"]
+
+[tool.mypy]
+# Strict type-checking on the modules written or changed in Phase 1. The older modules are not
+# yet clean; add them here as they are brought up to standard (CLAUDE.md §6.4).
+strict = true
+explicit_package_bases = true
+follow_imports = "silent"
+files = [
+    "services/redhand-core/src/redhand_core/auth",
+    "services/redhand-core/src/redhand_core/passports",
+    "services/redhand-core/src/redhand_core/main.py",
+    "services/redhand-core/src/redhand_core/config.py",
+    "services/redhand-core/src/redhand_core/routers/passports.py",
+    "services/redhand-core/src/redhand_core/routers/agent_auth.py",
+    "services/redhand-core/src/redhand_core/routers/dev.py",
+    "services/redhand-core/src/redhand_core/routers/state.py",
+    "services/redhand-core/src/redhand_core/routers/hitl.py",
+    "services/redhand-core/src/redhand_core/routers/telegram.py",
+    "services/redhand-core/src/redhand_core/routers/usage.py",
+    "services/redhand-core/src/redhand_core/routers/blackbox.py",
+    "services/redhand-core/src/redhand_core/routers/events.py",
+    "services/redhand-core/src/redhand_core/blackbox",
+    "services/redhand-core/src/redhand_core/fintech",
+    "services/redhand-core/src/redhand_core/routers/fintech.py",
+    "services/redhand-core/src/redhand_core/honeytokens",
+    "services/redhand-core/src/redhand_core/routers/honeytokens.py",
+    "services/redhand-core/src/redhand_core/routers/mcp_scan.py",
+    "services/redhand-core/src/redhand_core/routers/tool_pins.py",
+    "services/redhand-core/src/redhand_core/toolpins",
+    "services/redhand-core/src/redhand_core/radar",
+    "services/redhand-core/src/redhand_core/destinations",
+    "services/redhand-core/src/redhand_core/risk",
+    "services/redhand-core/src/redhand_core/routers/radar.py",
+    "services/redhand-core/src/redhand_core/routers/destinations.py",
+    "services/redhand-core/src/redhand_core/routers/risk.py",
+    "services/redhand-core/src/redhand_core/telegram",
+    "services/redhand-core/src/redhand_core/services/local_store.py",
+    "services/redhand-core/src/redhand_core/services/local_rpc.py",
+    "services/redhand-core/src/redhand_core/services/notifications/slack.py",
+    "services/redhand-core/src/redhand_core/net/outbound.py",
+    "services/redhand-core/src/redhand_core/middleware/body_limit.py",
+    "services/redhand-core/src/redhand_core/middleware/security_headers.py",
+    "services/redhand-core/src/redhand_core/services/rate_limit.py",
+    "services/redhand-core/src/redhand_core/net/source.py",
+    "services/redhand-core/src/redhand_core/spend/prices.py",
+    "services/redhand-core/src/redhand_core/spend/models.py",
+    "services/redhand-core/src/redhand_core/spend/service.py",
+    "services/redhand-core/src/redhand_core/routers/spend.py",
+    "services/redhand-core/src/redhand_core/approved/models.py",
+    "services/redhand-core/src/redhand_core/approved/service.py",
+    "services/redhand-core/src/redhand_core/routers/approved_models.py",
+    "services/redhand-core/src/redhand_core/sdkkeys/models.py",
+    "services/redhand-core/src/redhand_core/sdkkeys/service.py",
+    "services/redhand-core/src/redhand_core/routers/sdk_keys.py",
+
+    "services/redhand-core/src/redhand_core/routers/onboarding.py",
+
+    "services/redhand-core/src/redhand_core/onboarding",
+    "services/redhand-core/src/redhand_core/lifecycle",
+    "services/redhand-core/src/redhand_core/routers/lifecycle.py",
+    "services/redhand-core/src/redhand_core/insights",
+    "services/redhand-core/src/redhand_core/routers/insights.py",
+    "services/redhand-core/src/redhand_core/timeline/models.py",
+    "services/redhand-core/src/redhand_core/timeline/service.py",
+    "services/redhand-core/src/redhand_core/routers/timeline.py",
+    "services/redhand-core/src/redhand_core/services/safe_log.py",
+    "services/redhand-core/src/redhand_core/security",
+    "services/redhand-core/src/redhand_core/iam",
+    "services/redhand-core/src/redhand_core/siem",
+    "services/redhand-core/src/redhand_core/escalation",
+    "services/redhand-core/src/redhand_core/routers/siem.py",
+    "services/redhand-core/src/redhand_core/routers/escalation.py",
+    "agentwall/src/gateway",
+    "agentwall/src/bench",
+    "agentwall/src/main.py",
+    "agentwall/src/firewall/engine.py",
+    "agentwall/src/firewall/radar.py",
+    "agentwall/src/firewall/injection_model.py",
+    "agentwall/src/firewall/destinations.py",
+    "agentwall/config/settings.py",
+    "packages/redhand-sdk/src/redhand_sdk/scanner/secrets.py",
+    "packages/redhand-sdk/src/redhand_sdk/scanner/baseline.py",
+    "packages/redhand-sdk/src/redhand_sdk/adapters/usage.py",
+    "packages/redhand-sdk/src/redhand_sdk/adapters/langchain.py",
+]
+
+[[tool.mypy.overrides]]
+# PyYAML ships no type information and adding the stubs package would be a new dependency.
+module = "yaml"
+ignore_missing_imports = true

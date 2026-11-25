@@ -1,0 +1,12 @@
+{
+  "name": "redhand-monorepo",
+  "private": true,
+  "description": "Workspace root. The dashboard lives in apps/redhand-ui; these scripts delegate to it.",
+  "scripts": {
+    "dev": "npm --prefix apps/redhand-ui run dev",
+    "build": "npm --prefix apps/redhand-ui run build",
+    "start": "npm --prefix apps/redhand-ui run start",
+    "typecheck": "npm --prefix apps/redhand-ui run typecheck",
+    "lint": "npm --prefix apps/redhand-ui run lint"
+  }
+}

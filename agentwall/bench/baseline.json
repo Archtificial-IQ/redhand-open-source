@@ -1,0 +1,266 @@
+{
+  "categories": {
+    "injection_indirect": {
+      "benign": 294,
+      "by_lang": {
+        "en": {
+          "detected": 138,
+          "malicious": 138
+        },
+        "ms": {
+          "detected": 70,
+          "malicious": 70
+        }
+      },
+      "detected": 208,
+      "false_alarms": 10,
+      "families": 121,
+      "hard_benign": 96,
+      "hard_false_alarms": 10,
+      "malicious": 208,
+      "owasp": "LLM01",
+      "status": "partial"
+    },
+    "manifest_risk": {
+      "benign": 20,
+      "by_lang": {
+        "en": {
+          "detected": 13,
+          "malicious": 19
+        },
+        "ms": {
+          "detected": 1,
+          "malicious": 1
+        }
+      },
+      "detected": 14,
+      "false_alarms": 0,
+      "families": 11,
+      "hard_benign": 9,
+      "hard_false_alarms": 0,
+      "malicious": 20,
+      "owasp": "LLM06",
+      "status": "partial"
+    },
+    "output_path": {
+      "benign": 290,
+      "by_lang": {
+        "en": {
+          "detected": 112,
+          "malicious": 136
+        },
+        "ms": {
+          "detected": 59,
+          "malicious": 64
+        }
+      },
+      "detected": 171,
+      "false_alarms": 6,
+      "families": 185,
+      "hard_benign": 90,
+      "hard_false_alarms": 6,
+      "malicious": 200,
+      "owasp": "LLM05",
+      "status": "partial"
+    },
+    "output_ssrf": {
+      "benign": 290,
+      "by_lang": {
+        "en": {
+          "detected": 122,
+          "malicious": 137
+        },
+        "ms": {
+          "detected": 49,
+          "malicious": 63
+        }
+      },
+      "detected": 171,
+      "false_alarms": 8,
+      "families": 186,
+      "hard_benign": 90,
+      "hard_false_alarms": 8,
+      "malicious": 200,
+      "owasp": "LLM05",
+      "status": "partial"
+    },
+    "output_xss": {
+      "benign": 290,
+      "by_lang": {
+        "en": {
+          "detected": 132,
+          "malicious": 136
+        },
+        "ms": {
+          "detected": 62,
+          "malicious": 64
+        }
+      },
+      "detected": 194,
+      "false_alarms": 0,
+      "families": 143,
+      "hard_benign": 93,
+      "hard_false_alarms": 0,
+      "malicious": 200,
+      "owasp": "LLM05",
+      "status": "covered"
+    },
+    "secret_leak": {
+      "benign": 20,
+      "by_lang": {
+        "en": {
+          "detected": 7,
+          "malicious": 18
+        },
+        "ms": {
+          "detected": 2,
+          "malicious": 2
+        }
+      },
+      "detected": 9,
+      "false_alarms": 0,
+      "families": 15,
+      "hard_benign": 11,
+      "hard_false_alarms": 0,
+      "malicious": 20,
+      "owasp": "LLM02",
+      "status": "weak"
+    },
+    "tool_poisoning": {
+      "benign": 20,
+      "by_lang": {
+        "en": {
+          "detected": 17,
+          "malicious": 17
+        },
+        "ms": {
+          "detected": 3,
+          "malicious": 3
+        }
+      },
+      "detected": 20,
+      "false_alarms": 0,
+      "families": 9,
+      "hard_benign": 8,
+      "hard_false_alarms": 0,
+      "malicious": 20,
+      "owasp": "LLM01",
+      "status": "covered"
+    }
+  },
+  "corpus": "1eef50813cce3eaa",
+  "detectors": [
+    "egress_guardrail",
+    "radar",
+    "radar_model",
+    "manifest_auditor",
+    "description_auditor"
+  ],
+  "holdout": {
+    "injection_indirect": {
+      "benign": 32,
+      "by_lang": {
+        "en": {
+          "detected": 20,
+          "malicious": 23
+        },
+        "ms": {
+          "detected": 4,
+          "malicious": 5
+        }
+      },
+      "detected": 24,
+      "false_alarms": 0,
+      "families": 14,
+      "hard_benign": 10,
+      "hard_false_alarms": 0,
+      "malicious": 28,
+      "owasp": "LLM01",
+      "status": "partial"
+    },
+    "output_path": {
+      "benign": 20,
+      "by_lang": {
+        "en": {
+          "detected": 17,
+          "malicious": 18
+        },
+        "ms": {
+          "detected": 2,
+          "malicious": 2
+        }
+      },
+      "detected": 19,
+      "false_alarms": 0,
+      "families": 5,
+      "hard_benign": 10,
+      "hard_false_alarms": 0,
+      "malicious": 20,
+      "owasp": "LLM05",
+      "status": "covered"
+    },
+    "output_ssrf": {
+      "benign": 20,
+      "by_lang": {
+        "en": {
+          "detected": 18,
+          "malicious": 18
+        },
+        "ms": {
+          "detected": 2,
+          "malicious": 2
+        }
+      },
+      "detected": 20,
+      "false_alarms": 0,
+      "families": 6,
+      "hard_benign": 10,
+      "hard_false_alarms": 0,
+      "malicious": 20,
+      "owasp": "LLM05",
+      "status": "covered"
+    },
+    "output_xss": {
+      "benign": 20,
+      "by_lang": {
+        "en": {
+          "detected": 17,
+          "malicious": 17
+        },
+        "ms": {
+          "detected": 3,
+          "malicious": 3
+        }
+      },
+      "detected": 20,
+      "false_alarms": 0,
+      "families": 9,
+      "hard_benign": 10,
+      "hard_false_alarms": 0,
+      "malicious": 20,
+      "owasp": "LLM05",
+      "status": "covered"
+    },
+    "tool_poisoning": {
+      "benign": 20,
+      "by_lang": {
+        "en": {
+          "detected": 10,
+          "malicious": 16
+        },
+        "ms": {
+          "detected": 3,
+          "malicious": 4
+        }
+      },
+      "detected": 13,
+      "false_alarms": 0,
+      "families": 10,
+      "hard_benign": 12,
+      "hard_false_alarms": 0,
+      "malicious": 20,
+      "owasp": "LLM01",
+      "status": "partial"
+    }
+  }
+}
